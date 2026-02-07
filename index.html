@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Webカメラ物体検出デモ（COCO-SSD / サーバー不要）</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans JP", sans-serif; margin: 0; background: #0b0f14; color: #e6edf3; }
+    header { padding: 16px 18px; border-bottom: 1px solid rgba(255,255,255,.08); }
+    header h1 { font-size: 16px; margin: 0 0 6px; font-weight: 700; }
+    header p { margin: 0; font-size: 12px; color: rgba(230,237,243,.75); line-height: 1.5; }
+    .wrap { display: grid; grid-template-columns: 1fr; gap: 12px; padding: 14px; max-width: 1100px; margin: 0 auto; }
+    .panel { background: #0f1620; border: 1px solid rgba(255,255,255,.08); border-radius: 12px; overflow: hidden; box-shadow: 0 8px 30px rgba(0,0,0,.25); }
+    .controls { display: flex; flex-wrap: wrap; gap: 10px; padding: 12px; align-items: center; border-bottom: 1px solid rgba(255,255,255,.08); }
+    button, select, input[type="range"] {
+      background: #162233; color: #e6edf3; border: 1px solid rgba(255,255,255,.12);
+      border-radius: 10px; padding: 10px 12px; font-size: 13px;
+    }
+    button { cursor: pointer; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .stat { font-size: 12px; color: rgba(230,237,243,.8); margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; }
+    .stage { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #05070a; }
+    video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+    .note { padding: 10px 12px; font-size: 12px; color: rgba(230,237,243,.75); line-height: 1.6; }
+    .badge { display:inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid rgba(255,255,255,.14); font-size: 11px; opacity: .9; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    label { font-size: 12px; color: rgba(230,237,243,.75); }
+    a { color: #8bb9ff; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Webカメラ 物体検出デモ <span class="badge">COCO-SSD (TensorFlow.js)</span></h1>
+    <p>
+      GitHub Pagesなどの静的サイトで動作。HTTPS配信が必要（GitHub PagesはOK）。
+      一般物体80クラス対応。<br/>
+      ※「工具」「部品」はCOCOのカテゴリ外だと別ラベルになることがあります（例：tool→knife/remote等）。
+    </p>
+  </header>
+
+  <div class="wrap">
+    <div class="panel">
+      <div class="controls">
+        <button id="btnStart">カメラ開始</button>
+        <button id="btnStop" disabled>停止</button>
+
+        <div class="row">
+          <label>カメラ</label>
+          <select id="selCam" disabled></select>
+        </div>
+
+        <div class="row">
+          <label>信頼度しきい値: <span id="thVal">0.50</span></label>
+          <input id="rngTh" type="range" min="0" max="100" value="50" />
+        </div>
+
+        <div class="row">
+          <label>最大検出数</label>
+          <select id="selMax">
+            <option value="5">5</option>
+            <option value="10" selected>10</option>
+            <option value="20">20</option>
+          </select>
+        </div>
+
+        <div class="stat">
+          <span>状態: <b id="stStatus">待機</b></span>
+          <span>FPS: <b id="stFps">-</b></span>
+          <span>推論(ms): <b id="stMs">-</b></span>
+          <span>検出数: <b id="stN">-</b></span>
+        </div>
+      </div>
+
+      <div class="stage">
+        <video id="video" playsinline muted></video>
+        <canvas id="canvas"></canvas>
+      </div>
+
+      <div class="note">
+        <div>✅ 使い方：<b>「カメラ開始」</b> → 権限を許可 → 枠が表示されます。</div>
+        <div>⚠️ 注意：iPhone/Safariは性能差が出る場合あり。PCのChrome/Edge推奨。</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="note">
+        <b>GitHub Pagesに置く手順（超簡単）</b><br/>
+        1) リポジトリ作成 → 2) この <code>index.html</code> を置く → 3) Settings → Pages → Branchを選んで保存。<br/>
+        ページURLにアクセスするとそのまま動きます。<br/><br/>
+        <b>カスタム対象（工具/部品を確実に）</b>をやりたい場合は、次のステップとして
+        「独自データで学習したモデル（TFJS/ONNX）を読み込む」構成に変えるのが王道です。
+      </div>
+    </div>
+  </div>
+
+  <!-- TensorFlow.js & COCO-SSD (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2/dist/coco-ssd.min.js"></script>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    const video = $("video");
+    const canvas = $("canvas");
+    const ctx = canvas.getContext("2d");
+
+    const btnStart = $("btnStart");
+    const btnStop = $("btnStop");
+    const selCam = $("selCam");
+    const selMax = $("selMax");
+    const rngTh = $("rngTh");
+    const thVal = $("thVal");
+
+    const stStatus = $("stStatus");
+    const stFps = $("stFps");
+    const stMs = $("stMs");
+    const stN = $("stN");
+
+    let model = null;
+    let stream = null;
+    let running = false;
+    let rafId = null;
+
+    // FPS計測
+    let lastFrameT = 0;
+    let fpsSmooth = 0;
+
+    function setStatus(text) { stStatus.textContent = text; }
+
+    function resizeCanvasToVideo() {
+      const vw = video.videoWidth || 1280;
+      const vh = video.videoHeight || 720;
+      canvas.width = vw;
+      canvas.height = vh;
+    }
+
+    function drawBoxes(predictions, threshold) {
+      // まず映像を描画
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      // 枠の描画
+      ctx.lineWidth = 3;
+      ctx.font = "16px system-ui, -apple-system, Segoe UI, Roboto, Noto Sans JP, sans-serif";
+
+      let count = 0;
+      for (const p of predictions) {
+        if (p.score < threshold) continue;
+        count++;
+
+        const [x, y, w, h] = p.bbox;
+
+        // bbox
+        ctx.strokeStyle = "rgba(0, 255, 180, 0.95)";
+        ctx.strokeRect(x, y, w, h);
+
+        // label background
+        const label = `${p.class} ${(p.score*100).toFixed(1)}%`;
+        const pad = 6;
+        const textW = ctx.measureText(label).width;
+        const boxH = 22;
+
+        ctx.fillStyle = "rgba(0, 255, 180, 0.18)";
+        ctx.fillRect(x, Math.max(0, y - boxH), textW + pad*2, boxH);
+
+        // label text
+        ctx.fillStyle = "rgba(230, 255, 250, 0.95)";
+        ctx.fillText(label, x + pad, Math.max(16, y - 6));
+      }
+      stN.textContent = String(count);
+    }
+
+    async function listCameras() {
+      selCam.innerHTML = "";
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cams = devices.filter(d => d.kind === "videoinput");
+        cams.forEach((cam, i) => {
+          const opt = document.createElement("option");
+          opt.value = cam.deviceId;
+          opt.textContent = cam.label || `Camera ${i+1}`;
+          selCam.appendChild(opt);
+        });
+        selCam.disabled = cams.length === 0;
+      } catch (e) {
+        console.warn(e);
+        selCam.disabled = true;
+      }
+    }
+
+    async function startCamera(deviceId) {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        alert("このブラウザはgetUserMediaに対応していません。");
+        return;
+      }
+      if (stream) stopCamera();
+
+      const constraints = {
+        audio: false,
+        video: {
+          deviceId: deviceId ? { exact: deviceId } : undefined,
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          facingMode: "environment"
+        }
+      };
+
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+      await video.play();
+
+      resizeCanvasToVideo();
+      window.addEventListener("resize", resizeCanvasToVideo);
+
+      // 権限が得られた後でラベルが埋まることがある
+      await listCameras();
+      if (deviceId) selCam.value = deviceId;
+    }
+
+    function stopCamera() {
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      video.srcObject = null;
+    }
+
+    async function loadModel() {
+      // WebGLが使えない環境を想定して自動選択（tfjsが内部で最適化）
+      setStatus("モデル読み込み中...");
+      // 軽いウォームアップのため、backend初期化を待つ
+      await tf.ready();
+      model = await cocoSsd.load();
+      setStatus("準備OK");
+    }
+
+    async function loop() {
+      if (!running) return;
+
+      const t0 = performance.now();
+
+      // 推論（最大検出数）
+      const maxDet = Number(selMax.value);
+      const preds = await model.detect(video, maxDet);
+
+      const threshold = Number(rngTh.value) / 100;
+      drawBoxes(preds, threshold);
+
+      const t1 = performance.now();
+      const ms = t1 - t0;
+      stMs.textContent = ms.toFixed(0);
+
+      // FPS更新（簡易スムージング）
+      if (lastFrameT > 0) {
+        const instFps = 1000 / (t1 - lastFrameT);
+        fpsSmooth = fpsSmooth ? (fpsSmooth * 0.85 + instFps * 0.15) : instFps;
+        stFps.textContent = fpsSmooth.toFixed(1);
+      }
+      lastFrameT = t1;
+
+      rafId = requestAnimationFrame(loop);
+    }
+
+    function setUiRunning(isRunning) {
+      btnStart.disabled = isRunning;
+      btnStop.disabled = !isRunning;
+      selCam.disabled = !isRunning ? true : false; // 開始後は切り替え可
+    }
+
+    rngTh.addEventListener("input", () => {
+      thVal.textContent = (Number(rngTh.value) / 100).toFixed(2);
+    });
+
+    selCam.addEventListener("change", async () => {
+      if (!running) return;
+      try {
+        setStatus("カメラ切替中...");
+        await startCamera(selCam.value);
+        setStatus("検出中");
+      } catch (e) {
+        console.error(e);
+        alert("カメラ切替に失敗しました。別のカメラを試してください。");
+        setStatus("検出中");
+      }
+    });
+
+    btnStart.addEventListener("click", async () => {
+      try {
+        setUiRunning(true);
+        setStatus("初期化中...");
+        stFps.textContent = "-";
+        stMs.textContent = "-";
+        stN.textContent = "-";
+        lastFrameT = 0;
+        fpsSmooth = 0;
+
+        if (!model) await loadModel();
+        await startCamera(selCam.value || null);
+
+        running = true;
+        setStatus("検出中");
+        loop();
+      } catch (e) {
+        console.error(e);
+        alert("開始に失敗しました。HTTPSか、カメラ権限、対応ブラウザを確認してください。");
+        setStatus("待機");
+        running = false;
+        setUiRunning(false);
+        stopCamera();
+      }
+    });
+
+    btnStop.addEventListener("click", () => {
+      running = false;
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = null;
+      stopCamera();
+      setStatus("待機");
+      setUiRunning(false);
+    });
+
+    // 起動時
+    (async () => {
+      thVal.textContent = (Number(rngTh.value) / 100).toFixed(2);
+      setStatus("待機");
+      try {
+        await listCameras();
+      } catch {}
+    })();
+  </script>
+</body>
+</html>
